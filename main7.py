@@ -109,13 +109,37 @@ def analyze_intent(question, schema):
         return {"intent": "data", "refined": question}
 
 
-def generate_visual_diagram(schema):
-    print("📊 Architecting ER Diagram...")
-    prompt = f"Generate a Mermaid.js erDiagram for this schema: {schema}\nIdentify relationships based on ID columns. Output ONLY raw mermaid code, no backticks."
-    response = requests.post(QWEN_API, json={
-        "model": QWEN_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0.1
-    })
-    return response.json()['choices'][0]['message']['content'].strip()
+def build_er_diagram(tables_filter=None):
+    """Programmatically builds an accurate Mermaid erDiagram — no LLM hallucination."""
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+    all_tables = [r[0] for r in cursor.fetchall()]
+    tables = tables_filter if tables_filter else all_tables
+
+    table_cols = {}
+    for t in tables:
+        cursor.execute(f"PRAGMA table_info({t})")
+        table_cols[t] = [(col[1], col[2].split("(")[0].strip() or "TEXT") for col in cursor.fetchall()]
+    conn.close()
+
+    lines = ["erDiagram"]
+    for t, cols in table_cols.items():
+        lines.append(f"    {t} {{")
+        for col_name, col_type in cols:
+            lines.append(f"        {col_type} {col_name}")
+        lines.append("    }")
+
+    # Detect relationships via shared *_id columns
+    tlist = list(table_cols.keys())
+    for i, t1 in enumerate(tlist):
+        for t2 in tlist[i+1:]:
+            shared = {c[0] for c in table_cols[t1]} & {c[0] for c in table_cols[t2]}
+            for col in sorted(shared):
+                if col.endswith("_id"):
+                    lines.append(f'    {t1} ||--o{{ {t2} : "{col}"')
+
+    return "\n".join(lines)
 
 
 def generate_sql(question, schema):
@@ -198,7 +222,23 @@ def process_question(question):
         print("❌ This question doesn't relate to the database.")
 
     elif intent == "visualize":
-        diagram_code = generate_visual_diagram(schema)
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+        all_tables = [r[0] for r in cursor.fetchall()]
+        conn.close()
+
+        # Match table names from original question AND refined (Qwen may drop table names)
+        search_text = (question + " " + refined).lower()
+        mentioned = [t for t in all_tables if t.lower() in search_text]
+        filter_tables = mentioned if len(mentioned) >= 1 else None
+
+        if filter_tables:
+            print(f"📊 Building ER diagram for: {', '.join(filter_tables)}")
+        else:
+            print("📊 Building full ER diagram...")
+
+        diagram_code = build_er_diagram(filter_tables)
         render_mermaid(diagram_code)
 
     elif intent == "schema":
